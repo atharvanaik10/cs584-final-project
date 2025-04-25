@@ -157,14 +157,9 @@ if __name__ == '__main__':
 
     x_test, label = torch.load(args.data_file)
 
-    if args.algorithm == 'crown':
-        print('use default CROWN')
-        model = SimpleNNRelu()
-        model.load_state_dict(torch.load('models/relu_model.pth'))
-    else:
-        print('use simplex-verify algorithm')
-        model = SimpleNNRelu()
-        model.load_state_dict(torch.load('models/relu_model.pth'))
+        
+    model = SimpleNNRelu()
+    model.load_state_dict(torch.load('models/relu_model.pth'))
 
     batch_size = x_test.size(0)
     x_test = x_test.reshape(batch_size, -1)
@@ -179,7 +174,12 @@ if __name__ == '__main__':
     print(f"Verifiying Pertubation - {eps}")
     start_time = time.time()
     boundedmodel = BoundedSequential.convert(model)
-    ub, lb = boundedmodel.compute_bounds(x_U=x_u, x_L=x_l, upper=True, lower=True)
+    if args.algorithm == 'crown':
+        print('use default CROWN')
+        ub, lb = boundedmodel.compute_bounds(x_U=x_u, x_L=x_l, upper=True, lower=True)
+    else:
+        print('use simplex-verify algorithm')
+        ub, lb = boundedmodel.compute_bounds_sv(x_U=x_u, x_L=x_l, upper=True, lower=True)
     for i in range(batch_size):
         for j in range(y_size):
             print('f_{j}(x_{i}): {l:8.4f} <= f_{j}(x_{i}+delta) <= {u:8.4f}'.format(
