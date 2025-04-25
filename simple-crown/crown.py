@@ -1,10 +1,9 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from model import SimpleNNRelu, SimpleNNHardTanh
+from model import SimpleNNRelu
 from linear import BoundLinear
 from relu import BoundReLU
-from hardTanh_question import BoundHardTanh
 import time
 import argparse
 
@@ -30,8 +29,6 @@ class BoundedSequential(nn.Sequential):
                 layers.append(BoundLinear.convert(l))
             elif isinstance(l, nn.ReLU):
                 layers.append(BoundReLU.convert(l))
-            elif isinstance(l, nn.Hardtanh):
-                layers.append(BoundHardTanh.convert(l))
         return BoundedSequential(*layers)
 
     def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
@@ -80,8 +77,8 @@ class BoundedSequential(nn.Sequential):
         modules = list(self._modules.values())
         # CROWN propagation for all layers
         for i in range(len(modules)):
-            # We only need the bounds before a ReLU/HardTanh layer
-            if isinstance(modules[i], BoundReLU) or isinstance(modules[i], BoundHardTanh):
+            # We only need the bounds before a ReLU layer
+            if isinstance(modules[i], BoundReLU):
                 if isinstance(modules[i - 1], BoundLinear):
                     # add a batch dimension
                     newC = torch.eye(modules[i - 1].out_features).unsqueeze(0).repeat(x_U.shape[0], 1, 1).to(x_U)
@@ -152,22 +149,22 @@ class BoundedSequential(nn.Sequential):
 if __name__ == '__main__':
     # Create the parser
     parser = argparse.ArgumentParser()
-    parser.add_argument('-a', '--activation', default='relu', choices=['relu', 'hardtanh'],
-                        type=str, help='Activation Function')
+    parser.add_argument('-a', '--algorithm', default='crown', choices=['crown', 'simplex-verify'],
+                        type=str, help='Algorithm')
     parser.add_argument('data_file', type=str, help='input data, a tensor saved as a .pth file.')
     # Parse the command line arguments
     args = parser.parse_args()
 
     x_test, label = torch.load(args.data_file)
 
-    if args.activation == 'relu':
-        print('use ReLU model')
+    if args.algorithm == 'crown':
+        print('use default CROWN')
         model = SimpleNNRelu()
         model.load_state_dict(torch.load('models/relu_model.pth'))
     else:
-        print('use HardTanh model')
-        model = SimpleNNHardTanh()
-        model.load_state_dict(torch.load('models/hardtanh_model.pth'))
+        print('use simplex-verify algorithm')
+        model = SimpleNNRelu()
+        model.load_state_dict(torch.load('models/relu_model.pth'))
 
     batch_size = x_test.size(0)
     x_test = x_test.reshape(batch_size, -1)
