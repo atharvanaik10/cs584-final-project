@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class BoundLinear(nn.Linear):
-    def __init(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True):
         super(BoundLinear, self).__init__(in_features, out_features, bias)
 
     @staticmethod
@@ -22,6 +22,21 @@ class BoundLinear(nn.Linear):
         l.bias.data.copy_(linear_layer.bias.data)
         l.bias.data = l.bias.to(linear_layer.bias.device)
         return l
+    
+    def simplex_alpha(self):
+        """Get rescaling coefficient alpha to ensure outputs of linear layer remain simplex
+
+        From Section 4.1 in the simplex-verify paper
+        """
+        device = self.weight.device
+        in_dim = self.weight.shape[1]
+        max_sum = 0
+        for i in range(in_dim):
+            e_i = torch.zeros((1, in_dim), device=device)
+            e_i[0, i] = 1
+            z = torch.relu(nn.functional.linear(e_i, self.weight, self.bias))
+            max_sum = max(max_sum, z.sum().item())
+        return max_sum
 
     def boundpropogate(self, last_uA, last_lA, start_node=None):
         r"""Bound propagate through the linear layer
