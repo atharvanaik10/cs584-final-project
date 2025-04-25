@@ -31,7 +31,7 @@ class BoundedSequential(nn.Sequential):
                 layers.append(BoundReLU.convert(l))
         return BoundedSequential(*layers)
 
-    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
+    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False, simplex_verify=False):
         r"""Main function for computing bounds.
 
         Args:
@@ -51,7 +51,10 @@ class BoundedSequential(nn.Sequential):
             lb (tensor): The lower bound of the final output.
         """
         ub = lb = None
-        ub, lb = self.full_boundpropogation(x_U=x_U, x_L=x_L, upper=upper, lower=lower)
+        if (simplex_verify):
+            ub, lb = self.full_boundpropogation_sv(x_U=x_U, x_L=x_L, upper=upper, lower=lower)
+        else:
+            ub, lb = self.full_boundpropogation(x_U=x_U, x_L=x_L, upper=upper, lower=lower)
         return ub, lb
 
     def full_boundpropogation(self, x_U=None, x_L=None, upper=True, lower=True):
@@ -145,6 +148,87 @@ class BoundedSequential(nn.Sequential):
             lb = x_L.new([-np.inf])
         return ub, lb
 
+class SimplexBoundedSequential(BoundedSequential):
+    """This class wraps the above BoundedSequential object with simplex bound computation.
+    """
+    def __init__(self, *args):
+        super(SimplexBoundedSequential, self).__init__(*args)
+
+    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
+        return self.compute_bounds_simplex_verify(x_U=x_U, x_L=x_L)
+
+    def compute_bounds_simplex_verify(self, x_U=None, x_L=None, num_iters=10):
+        modules = list(self._modules.values())
+        n_layers = len(modules)
+        a = [torch.nn.Parameter(torch.rand(1), requires_grad=True) for _ in range(n_layers)]
+        abar = [torch.nn.Parameter(torch.rand(1), requires_grad=True) for _ in range(n_layers)]
+        opt = torch.optim.Adam(a + abar, lr=0.01)
+
+        x_U = self.simplex_projection(x_U)
+        x_L = self.simplex_projection(x_L)
+
+        for _ in range(num_iters):
+            opt.zero_grad()
+            loss = self.simplex_backward(modules, a, abar, x_U, x_L)
+            (-loss).backward()
+            opt.step()
+            for param in a + abar:
+                param.data.clamp_(0, 1)
+
+        final_loss = self.simplex_backward(modules, a, abar, x_U, x_L)
+        return final_loss, final_loss
+
+    def simplex_backward(self, modules, a, abar, x_U, x_L):
+        batch_size = x_U.shape[0]
+        n_layers = len(modules)
+        device = x_U.device
+
+        f_pos = torch.eye(modules[-1].out_features, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+        f_neg = torch.zeros_like(f_pos)
+        f_cst = torch.zeros((batch_size, modules[-1].out_features), device=device)
+
+        for idx in reversed(range(n_layers)):
+            layer = modules[idx]
+            if isinstance(layer, BoundLinear):
+                w = layer.weight
+                b = layer.bias
+
+                alpha = layer.simplex_alpha()
+
+                def u_k(x):
+                    return torch.relu(nn.functional.linear(x, w, b)) / alpha
+
+                def u_k_prime(x):
+                    terms = []
+                    for i in range(w.shape[1]):
+                        ei = torch.zeros_like(x)
+                        ei[:, i] = 1.0
+                        y_i = torch.relu(nn.functional.linear(ei, w, b)) - torch.relu(nn.functional.linear(torch.zeros_like(x), w, b))
+                        terms.append(x[:, i:i+1] * y_i)
+                    return sum(terms) + torch.relu(nn.functional.linear(torch.zeros_like(x), w, b)) / alpha
+
+                upper_term = abar[idx] * u_k(x_L) + (1 - abar[idx]) * u_k_prime(x_L)
+                lower_term = a[idx] * (nn.functional.linear(x_L, w, b) / alpha)
+
+                f_new_neg = f_neg.bmm(upper_term.unsqueeze(-1)).squeeze(-1)
+                f_new_pos = f_pos.bmm(lower_term.unsqueeze(-1)).squeeze(-1)
+                f_new_cst = f_cst
+
+                f = f_new_neg + f_new_pos + f_new_cst
+                f_pos = f.unsqueeze(-1)
+                f_neg = torch.zeros_like(f_pos)
+                f_cst = torch.zeros_like(f)
+
+            elif isinstance(layer, BoundReLU):
+                continue
+
+        return f.sum(dim=1).mean()
+
+    def simplex_projection(self, x):
+        x = torch.clamp(x, min=0)
+        s = torch.sum(x, dim=1, keepdim=True)
+        return x / torch.maximum(s, torch.ones_like(s))
+    
 
 if __name__ == '__main__':
     # Create the parser
@@ -157,7 +241,6 @@ if __name__ == '__main__':
 
     x_test, label = torch.load(args.data_file)
 
-        
     model = SimpleNNRelu()
     model.load_state_dict(torch.load('models/relu_model.pth'))
 
@@ -173,13 +256,16 @@ if __name__ == '__main__':
 
     print(f"Verifiying Pertubation - {eps}")
     start_time = time.time()
-    boundedmodel = BoundedSequential.convert(model)
+
     if args.algorithm == 'crown':
         print('use default CROWN')
-        ub, lb = boundedmodel.compute_bounds(x_U=x_u, x_L=x_l, upper=True, lower=True)
+        boundedmodel = BoundedSequential.convert(model)
     else:
         print('use simplex-verify algorithm')
-        ub, lb = boundedmodel.compute_bounds_sv(x_U=x_u, x_L=x_l, upper=True, lower=True)
+        boundedmodel = SimplexBoundedSequential.convert(model)
+    
+    ub, lb = boundedmodel.compute_bounds(x_U=x_u, x_L=x_l, upper=True, lower=True)
+
     for i in range(batch_size):
         for j in range(y_size):
             print('f_{j}(x_{i}): {l:8.4f} <= f_{j}(x_{i}+delta) <= {u:8.4f}'.format(
