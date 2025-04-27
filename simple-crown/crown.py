@@ -31,7 +31,7 @@ class BoundedSequential(nn.Sequential):
                 layers.append(BoundReLU.convert(l))
         return BoundedSequential(*layers)
 
-    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False, simplex_verify=False):
+    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
         r"""Main function for computing bounds.
 
         Args:
@@ -51,10 +51,7 @@ class BoundedSequential(nn.Sequential):
             lb (tensor): The lower bound of the final output.
         """
         ub = lb = None
-        if (simplex_verify):
-            ub, lb = self.full_boundpropogation_sv(x_U=x_U, x_L=x_L, upper=upper, lower=lower)
-        else:
-            ub, lb = self.full_boundpropogation(x_U=x_U, x_L=x_L, upper=upper, lower=lower)
+        ub, lb = self.full_boundpropogation(x_U=x_U, x_L=x_L, upper=upper, lower=lower)
         return ub, lb
 
     def full_boundpropogation(self, x_U=None, x_L=None, upper=True, lower=True):
@@ -148,16 +145,34 @@ class BoundedSequential(nn.Sequential):
             lb = x_L.new([-np.inf])
         return ub, lb
 
-class SimplexBoundedSequential(BoundedSequential):
+class SimplexBoundedSequential(nn.Sequential):
     """This class wraps the above BoundedSequential object with simplex bound computation.
     """
     def __init__(self, *args):
         super(SimplexBoundedSequential, self).__init__(*args)
 
-    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
-        return self.compute_bounds_simplex_verify(x_U=x_U, x_L=x_L)
+    @staticmethod
+    def convert(seq_model):
+        r"""Convert a Pytorch model to a model with bounds.
+        Args:
+            seq_model: An nn.Sequential module.
 
-    def compute_bounds_simplex_verify(self, x_U=None, x_L=None, num_iters=10):
+        Returns:
+            The converted BoundedSequential module.
+        """
+        layers = []
+        for l in seq_model:
+            if isinstance(l, nn.Linear):
+                layers.append(BoundLinear.convert(l))
+            elif isinstance(l, nn.ReLU):
+                layers.append(BoundReLU.convert(l))
+        return SimplexBoundedSequential(*layers)
+
+
+    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
+        return self.simplex_verify(x_U=x_U, x_L=x_L)
+
+    def simplex_verify(self, x_U=None, x_L=None, num_iters=10):
         modules = list(self._modules.values())
         n_layers = len(modules)
         a = [torch.nn.Parameter(torch.rand(1), requires_grad=True) for _ in range(n_layers)]
@@ -168,6 +183,7 @@ class SimplexBoundedSequential(BoundedSequential):
         x_L = self.simplex_projection(x_L)
 
         for _ in range(num_iters):
+            print("here")
             opt.zero_grad()
             loss = self.simplex_backward(modules, a, abar, x_U, x_L)
             (-loss).backward()
