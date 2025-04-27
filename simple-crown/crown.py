@@ -174,76 +174,142 @@ class SimplexBoundedSequential(nn.Sequential):
 
     def simplex_verify(self, x_U=None, x_L=None, num_iters=10):
         modules = list(self._modules.values())
-        n_layers = len(modules)
-        a = [torch.nn.Parameter(torch.rand(1), requires_grad=True) for _ in range(n_layers)]
-        abar = [torch.nn.Parameter(torch.rand(1), requires_grad=True) for _ in range(n_layers)]
-        opt = torch.optim.Adam(a + abar, lr=0.01)
+        device  = x_U.device
 
-        x_U = self.simplex_projection(x_U)
-        x_L = self.simplex_projection(x_L)
+        # one parameter per neuron
+        a, abar = [], []
+        for m in modules:
+            if isinstance(m, BoundLinear):
+                a.append(nn.Parameter(torch.rand(m.out_features, device=device)))
+                abar.append(nn.Parameter(torch.rand(m.out_features, device=device)))
+            else:
+                # placeholder so that a[idx] is defined for every index
+                a.append(None)
+                abar.append(None)
+
+        opt = torch.optim.Adam([p for p in a + abar if p is not None], lr=1e-2)
+
+        x_U = self.project_simplex(x_U)
+        x_L = self.project_simplex(x_L)
+
+        self.attach_interval_bounds(x_L, x_U)
 
         for _ in range(num_iters):
-            print("here")
             opt.zero_grad()
-            loss = self.simplex_backward(modules, a, abar, x_U, x_L)
-            (-loss).backward()
+            loss = -self.simplex_backward(modules, a, abar, x_L).mean()
+            loss.backward(retain_graph=True)
             opt.step()
-            for param in a + abar:
-                param.data.clamp_(0, 1)
+            for p in a + abar:
+                if p is not None:
+                    p.data.clamp_(0.0, 1.0)
 
-        final_loss = self.simplex_backward(modules, a, abar, x_U, x_L)
-        return final_loss, final_loss
-
-    def simplex_backward(self, modules, a, abar, x_U, x_L):
-        batch_size = x_U.shape[0]
-        n_layers = len(modules)
-        device = x_U.device
-
-        f_pos = torch.eye(modules[-1].out_features, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
-        f_neg = torch.zeros_like(f_pos)
-        f_cst = torch.zeros((batch_size, modules[-1].out_features), device=device)
-
-        for idx in reversed(range(n_layers)):
-            layer = modules[idx]
+        bound = self.simplex_backward(modules, a, abar, x_L)
+        return bound, bound
+    
+    def attach_interval_bounds(self, x_L, x_U):
+        """
+        Forward interval-bound propagation.
+        After the call every BoundLinear / BoundReLU layer owns
+        .lower_l  and .upper_u  tensors with shape  (batch, out_features).
+        """
+        L, U = x_L, x_U
+        for layer in self._modules.values():
             if isinstance(layer, BoundLinear):
-                w = layer.weight
-                b = layer.bias
+                W, b = layer.weight, layer.bias
+                W_pos, W_neg = W.clamp(min=0), W.clamp(max=0)
+                L_next = L @ W_pos.t() + U @ W_neg.t() + b
+                U_next = U @ W_pos.t() + L @ W_neg.t() + b
+                layer.lower_l, layer.upper_u = L_next, U_next
+                L, U = L_next, U_next
+            elif isinstance(layer, BoundReLU):
+                L, U = L.clamp(min=0), U.clamp(min=0)
+                layer.lower_l, layer.upper_u = L, U
 
-                alpha = layer.simplex_alpha()
+    def simplex_backward(self, layers, a, abar, x_L):
+        batch = x_L.size(0)
+        device = x_L.device
 
-                def u_k(x):
-                    return torch.relu(nn.functional.linear(x, w, b)) / alpha
+        # Start with identity specification
+        A_pos = torch.eye(layers[-1].out_features, device=device).expand(batch, -1, -1)
+        A_neg = torch.zeros_like(A_pos)
+        bias  = torch.zeros(batch, layers[-1].out_features, device=device)
 
-                def u_k_prime(x):
-                    terms = []
-                    for i in range(w.shape[1]):
-                        ei = torch.zeros_like(x)
-                        ei[:, i] = 1.0
-                        y_i = torch.relu(nn.functional.linear(ei, w, b)) - torch.relu(nn.functional.linear(torch.zeros_like(x), w, b))
-                        terms.append(x[:, i:i+1] * y_i)
-                    return sum(terms) + torch.relu(nn.functional.linear(torch.zeros_like(x), w, b)) / alpha
+        for idx in reversed(range(len(layers))):
+            layer = layers[idx]
 
-                upper_term = abar[idx] * u_k(x_L) + (1 - abar[idx]) * u_k_prime(x_L)
-                lower_term = a[idx] * (nn.functional.linear(x_L, w, b) / alpha)
+            if isinstance(layer, BoundLinear):
+                W, b = layer.weight, layer.bias
+                W_pos, W_neg = W.clamp(min=0), W.clamp(max=0)
 
-                f_new_neg = f_neg.bmm(upper_term.unsqueeze(-1)).squeeze(-1)
-                f_new_pos = f_pos.bmm(lower_term.unsqueeze(-1)).squeeze(-1)
-                f_new_cst = f_cst
+                # interval bounds (already attached by _attach_interval_bounds)
+                l_k, u_k = layer.lower_l, layer.upper_u
+                theta = (u_k - l_k) / (u_k - l_k + 1e-12)         #   θ_k
+                gamma = -l_k                                      #   γ_k
 
-                f = f_new_neg + f_new_pos + f_new_cst
-                f_pos = f.unsqueeze(-1)
-                f_neg = torch.zeros_like(f_pos)
-                f_cst = torch.zeros_like(f)
+                batch = A_pos.size(0)
+
+                # broadcast a_k  and ā_k
+                coef_a    = a[idx].view(1, 1, -1).expand(batch, -1, -1)      # (batch,1,out)
+                coef_abar = abar[idx].view(1, 1, -1).expand(batch, -1, -1)
+
+                # broadcast weights
+                W_pos_b = W_pos.unsqueeze(0).expand(batch, -1, -1)           # (batch,out,in)
+                W_neg_b = W_neg.unsqueeze(0).expand(batch, -1, -1)
+
+                # broadcast θ and γ
+                theta_b = theta.unsqueeze(-1)                                # (batch,out,1)
+                gamma_b = gamma.unsqueeze(-1)                                # (batch,out,1)
+
+                # affine-map propagation
+                A_pos_new = (coef_a    * A_pos) @ W_pos_b + \
+                            (coef_abar * A_neg) @ (theta_b * W_pos_b)
+
+                A_neg_new = (coef_a    * A_neg) @ W_neg_b + \
+                            (coef_abar * A_pos) @ (theta_b * W_neg_b)
+
+                # broadcast bias vectors per batch
+                b_pos_exp = b.clamp(min=0).unsqueeze(0).expand(batch, -1)     # (batch,out)
+                b_neg_exp = b.clamp(max=0).unsqueeze(0).expand(batch, -1)     # (batch,out)
+
+                # gamma for Planet upper shift
+                gamma_b = gamma.unsqueeze(-1)  # (batch,out,1)
+
+                # bias update – three terms
+                bias = bias \
+                    + torch.bmm(A_pos, b_pos_exp.unsqueeze(-1)).squeeze(-1) \
+                    + torch.bmm(A_neg, b_neg_exp.unsqueeze(-1)).squeeze(-1) \
+                    + torch.bmm(coef_abar * A_neg, gamma_b).squeeze(-1)
+
+                A_pos, A_neg = A_pos_new, A_neg_new
 
             elif isinstance(layer, BoundReLU):
-                continue
+                lb = layer.lower_l.clamp(max=0)
+                ub = layer.upper_u.clamp(min=0)
+                slope = ub / (ub - lb + 1e-12)
+                mask  = (slope > 0.5).float()
 
-        return f.sum(dim=1).mean()
+                pos = A_pos.clamp(min=0); neg = A_pos.clamp(max=0)
+                A_pos = slope * pos + mask * neg
 
-    def simplex_projection(self, x):
-        x = torch.clamp(x, min=0)
-        s = torch.sum(x, dim=1, keepdim=True)
-        return x / torch.maximum(s, torch.ones_like(s))
+                pos = A_neg.clamp(min=0); neg = A_neg.clamp(max=0)
+                A_neg = slope * neg + mask * pos
+
+                inc = torch.bmm(A_pos + A_neg, (-lb * slope).unsqueeze(-1)).squeeze(-1)
+                bias = bias + inc
+
+        # concrete lower bound on simplex (worst case = min since A_pos ≥0, A_neg≤0)
+        z_min = self.project_simplex(x_L)
+        bound = (A_pos + A_neg).bmm(z_min.view(batch, -1, 1)).squeeze(-1) + bias
+        return bound
+
+    def project_simplex(self, x):
+        v, _ = torch.sort(x, dim=1, descending=True)
+        cssv = torch.cumsum(v, dim=1) - 1
+        ind  = torch.arange(1, x.size(1) + 1, device=x.device)
+        cond = v - cssv / ind > 0
+        rho  = cond.sum(dim=1, keepdim=True)
+        theta = cssv.gather(1, rho - 1) / rho
+        return torch.clamp(x - theta, min=0)
     
 
 if __name__ == '__main__':
