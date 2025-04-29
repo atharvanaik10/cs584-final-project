@@ -21,6 +21,7 @@ class BoundLinear(nn.Linear):
         l.weight.data = l.weight.data.to(linear_layer.weight.device)
         l.bias.data.copy_(linear_layer.bias.data)
         l.bias.data = l.bias.to(linear_layer.bias.device)
+        l.alpha = l.simplex_alpha()
         return l
     
     def simplex_alpha(self):
@@ -36,7 +37,32 @@ class BoundLinear(nn.Linear):
             e_i[0, i] = 1
             z = torch.relu(nn.functional.linear(e_i, self.weight, self.bias))
             max_sum = max(max_sum, z.sum().item())
-        return max_sum
+        
+        zero_vertex_sum = torch.relu(self.bias).sum().item()
+        return max(max_sum, zero_vertex_sum)
+    
+    def simplex_hull(self, x):
+        """
+        Compute y_CH(x) = sum_j x_j [ReLU(w^T e_j + b) - ReLU(b)] + ReLU(b)
+        where e_j is the j-th standard basis vector.
+        x: (batch, in_features)
+        returns: (batch, out_features)
+        """
+        # h0_k = ReLU(b_k)
+        h0 = torch.relu(self.bias)                           # (out_features,)
+
+        # preactivation on each vertex e_j: w_kj + b_k
+        #   self.weight: (out_features, in_features)
+        pre = self.weight + self.bias.unsqueeze(1)           # (out, in)
+        h_e = torch.relu(pre)                                # (out, in)
+
+        # difference term ∆_{kj} = h_e[k,j] - h0[k]
+        delta = h_e - h0.unsqueeze(1)                        # (out, in)
+
+        # now x @ delta^T + h0
+        #   x: (batch, in), delta^T: (in, out)
+        y = x.matmul(delta.t()) + h0.unsqueeze(0)            # (batch, out)
+        return y
 
     def boundpropogate(self, last_uA, last_lA, start_node=None):
         r"""Bound propagate through the linear layer

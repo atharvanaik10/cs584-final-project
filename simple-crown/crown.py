@@ -50,11 +50,9 @@ class BoundedSequential(nn.Sequential):
 
             lb (tensor): The lower bound of the final output.
         """
-        ub = lb = None
-        ub, lb = self.full_boundpropogation(x_U=x_U, x_L=x_L, upper=upper, lower=lower)
-        return ub, lb
+        return self.full_boundpropogation(x_U=x_U, x_L=x_L, upper=upper, lower=lower, optimize=optimize)
 
-    def full_boundpropogation(self, x_U=None, x_L=None, upper=True, lower=True):
+    def full_boundpropogation(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
         r"""A full bound propagation. We are going to sequentially compute the
         intermediate bounds for each linear layer followed by a ReLU layer. For each
         intermediate bound, we call self.boundpropogate_from_layer() to do a bound propagation
@@ -87,10 +85,14 @@ class BoundedSequential(nn.Sequential):
                     ub, lb = self.boundpropogate_from_layer(x_U=x_U, x_L=x_L, C=newC, upper=True, lower=True,
                                                             start_node=i - 1)
                 # Set pre-activation bounds for layer i (the ReLU layer)
-                modules[i].upper_u = ub
-                modules[i].lower_l = lb
+                modules[i].upper_u = ub 
+                modules[i].lower_l = lb 
         # Get the final layer bound
-        return self.boundpropogate_from_layer(x_U=x_U, x_L=x_L,
+        if optimize:
+            ans = self.simplex_verify(x_U=x_U, x_L=x_L)
+            return ans, ans
+        else:
+            return self.boundpropogate_from_layer(x_U=x_U, x_L=x_L,
                                               C=torch.eye(modules[i].out_features).unsqueeze(0).to(x_U), upper=upper,
                                               lower=lower, start_node=i)
 
@@ -145,171 +147,128 @@ class BoundedSequential(nn.Sequential):
             lb = x_L.new([-np.inf])
         return ub, lb
 
-class SimplexBoundedSequential(nn.Sequential):
-    """This class wraps the above BoundedSequential object with simplex bound computation.
-    """
-    def __init__(self, *args):
-        super(SimplexBoundedSequential, self).__init__(*args)
+    def simplex_verify(self, x_U, x_L, num_iters=3, lr=0.1):
+        """
+        Runs projected gradient ascent on the dual weights (a_list, abar_list),
+        calling simplex_backward each iteration, and returns the final lower bound.
+        """
+        # 1) Collect BoundLinear layers
+        modules = list(self._modules.values())
+        # skip last linear layer since it has no activation
+        linear_layers = [m for m in modules if isinstance(m, BoundLinear)][:-1]
 
+        # 2) Initialize dual vectors in [0,1]
+        a_list    = [torch.empty(layer.out_features, device=x_U.device).uniform_(0,1).requires_grad_(True) 
+                     for layer in linear_layers]
+        abar_list = [torch.empty(layer.out_features, device=x_U.device).uniform_(0,1).requires_grad_(True)
+                     for layer in linear_layers]
+
+        optimizer = torch.optim.Adam(a_list + abar_list, lr=lr)
+
+        # 3) Gradient ascent loop
+        for _ in range(num_iters):
+            lb = self.simplex_backward(x_U, x_L, a_list, abar_list)
+            loss = -lb.mean()        # maximize mean lower bound
+            optimizer.zero_grad()
+            loss.backward()
+            # project back into [0,1]
+            with torch.no_grad():
+                for v in a_list + abar_list:
+                    v.clamp_(0, 1)
+
+        # 5) Return tightened lower bound
+        return self.simplex_backward(x_U, x_L, a_list, abar_list)
+    
+    def simplex_backward(self, x_U, x_L, a_list, abar_list):
+        modules = list(self._modules.values())
+        batch_size = x_U.size(0)
+        out_dim = modules[-1].out_features
+
+        # Initialize the final affine spec f(x) = A x + b
+        A = torch.eye(out_dim, device=x_U.device).unsqueeze(0).repeat(batch_size,1,1)
+        b = torch.zeros(batch_size, out_dim, device=x_U.device)
+
+        for m in reversed(modules):
+            if isinstance(m, BoundLinear):
+                # boundpropogate returns (uA, ubias, lA, lbias)
+                # we only care about uA and ubias here
+                A, ubias, _, _ = m.boundpropogate(A, None)
+                # now shift b by that bias
+                b = b + ubias
+                break
+
+        # Find all the linear‐layer indices in order, skip last one
+        lin_indices = [i for i,m in enumerate(modules) if isinstance(m, BoundLinear)][:-1]
+        # We'll consume a_list/abar_list in reverse:
+        li = len(lin_indices) - 1
+
+        # Walk backwards over the linear layers but drop last one
+        for i in reversed(lin_indices):
+            linear = modules[i]
+            relu = modules[i+1]  # the very next module is that layer's ReLU
+
+            a = a_list[li]
+            abar = abar_list[li]
+            li -= 1
+
+            # Zero‐input for bias computation
+            x0 = torch.zeros(batch_size, linear.in_features, device=x_U.device)
+
+            # Jacobians at x0:
+            def upper_fn(x): 
+                # planet bound from ReLU + convex‐hull bound
+                return ( abar.view(1,-1) * relu.upper_u + 
+                        (1-abar).view(1,-1) * linear.simplex_hull(x) )
+            def lower_fn(x):
+                return a.view(1,-1) * linear(x)
+            
+            # Bias terms:
+            ubias = upper_fn(x0)
+            lbias = lower_fn(x0)
+
+            if ubias.shape[1] == out_dim:  
+                # now ubias, lbias, b all are (batch, out_dim)==(batch,10)
+                b = ubias + lbias + b
+
+            full_Ju = torch.autograd.functional.jacobian(upper_fn, x0, vectorize=True)
+            full_Jl = torch.autograd.functional.jacobian(lower_fn, x0, vectorize=True)
+            full_Ju = full_Ju.permute(0,2,1,3)
+            full_Jl = full_Jl.permute(0,2,1,3)
+            idx = torch.arange(batch_size, device=x0.device)
+            Ju = full_Ju[idx, idx]   # picks Ju[k] = full_Ju[k,k,:,:]
+            Jl = full_Jl[idx, idx]
+
+            # Decompose A into pos/neg and apply:
+            A_pos = A.clamp(min=0)
+            A_neg = A.clamp(max=0)
+            A = torch.bmm(A_neg, Ju) + torch.bmm(A_pos, Jl)
+
+        # Finally, minimize over x∈Δ by taking the minimum over the vertices:
+        min_vert = A.min(dim=2).values
+        return b + min_vert
+
+
+class SimplexBoundedSequential(BoundedSequential):
     @staticmethod
     def convert(seq_model):
-        r"""Convert a Pytorch model to a model with bounds.
-        Args:
-            seq_model: An nn.Sequential module.
+        # convert all layers as before
+        bs = BoundedSequential.convert(seq_model)
 
-        Returns:
-            The converted BoundedSequential module.
-        """
-        layers = []
-        for l in seq_model:
-            if isinstance(l, nn.Linear):
-                layers.append(BoundLinear.convert(l))
-            elif isinstance(l, nn.ReLU):
-                layers.append(BoundReLU.convert(l))
-        return SimplexBoundedSequential(*layers)
-
-
-    def compute_bounds(self, x_U=None, x_L=None, upper=True, lower=True, optimize=False):
-        return self.simplex_verify(x_U=x_U, x_L=x_L)
-
-    def simplex_verify(self, x_U=None, x_L=None, num_iters=10):
-        modules = list(self._modules.values())
-        device  = x_U.device
-
-        # one parameter per neuron
-        a, abar = [], []
-        for m in modules:
+        # simplex-propagation: for each BoundLinear except the last,
+        # divide its weights/bias by alpha and multiply the next 
+        # linear layer by alpha
+        modules = list(bs._modules.values())
+        for i, m in enumerate(modules[:-1]):
             if isinstance(m, BoundLinear):
-                a.append(nn.Parameter(torch.rand(m.out_features, device=device)))
-                abar.append(nn.Parameter(torch.rand(m.out_features, device=device)))
-            else:
-                # placeholder so that a[idx] is defined for every index
-                a.append(None)
-                abar.append(None)
-
-        opt = torch.optim.Adam([p for p in a + abar if p is not None], lr=1e-2)
-
-        x_U = self.project_simplex(x_U)
-        x_L = self.project_simplex(x_L)
-
-        self.attach_interval_bounds(x_L, x_U)
-
-        for _ in range(num_iters):
-            opt.zero_grad()
-            loss = -self.simplex_backward(modules, a, abar, x_L).mean()
-            loss.backward(retain_graph=True)
-            opt.step()
-            for p in a + abar:
-                if p is not None:
-                    p.data.clamp_(0.0, 1.0)
-
-        bound = self.simplex_backward(modules, a, abar, x_L)
-        return bound, bound
-    
-    def attach_interval_bounds(self, x_L, x_U):
-        """
-        Forward interval-bound propagation.
-        After the call every BoundLinear / BoundReLU layer owns
-        .lower_l  and .upper_u  tensors with shape  (batch, out_features).
-        """
-        L, U = x_L, x_U
-        for layer in self._modules.values():
-            if isinstance(layer, BoundLinear):
-                W, b = layer.weight, layer.bias
-                W_pos, W_neg = W.clamp(min=0), W.clamp(max=0)
-                L_next = L @ W_pos.t() + U @ W_neg.t() + b
-                U_next = U @ W_pos.t() + L @ W_neg.t() + b
-                layer.lower_l, layer.upper_u = L_next, U_next
-                L, U = L_next, U_next
-            elif isinstance(layer, BoundReLU):
-                L, U = L.clamp(min=0), U.clamp(min=0)
-                layer.lower_l, layer.upper_u = L, U
-
-    def simplex_backward(self, layers, a, abar, x_L):
-        batch = x_L.size(0)
-        device = x_L.device
-
-        # Start with identity specification
-        A_pos = torch.eye(layers[-1].out_features, device=device).expand(batch, -1, -1)
-        A_neg = torch.zeros_like(A_pos)
-        bias  = torch.zeros(batch, layers[-1].out_features, device=device)
-
-        for idx in reversed(range(len(layers))):
-            layer = layers[idx]
-
-            if isinstance(layer, BoundLinear):
-                W, b = layer.weight, layer.bias
-                W_pos, W_neg = W.clamp(min=0), W.clamp(max=0)
-
-                # interval bounds (already attached by _attach_interval_bounds)
-                l_k, u_k = layer.lower_l, layer.upper_u
-                theta = (u_k - l_k) / (u_k - l_k + 1e-12)         #   θ_k
-                gamma = -l_k                                      #   γ_k
-
-                batch = A_pos.size(0)
-
-                # broadcast a_k  and ā_k
-                coef_a    = a[idx].view(1, 1, -1).expand(batch, -1, -1)      # (batch,1,out)
-                coef_abar = abar[idx].view(1, 1, -1).expand(batch, -1, -1)
-
-                # broadcast weights
-                W_pos_b = W_pos.unsqueeze(0).expand(batch, -1, -1)           # (batch,out,in)
-                W_neg_b = W_neg.unsqueeze(0).expand(batch, -1, -1)
-
-                # broadcast θ and γ
-                theta_b = theta.unsqueeze(-1)                                # (batch,out,1)
-                gamma_b = gamma.unsqueeze(-1)                                # (batch,out,1)
-
-                # affine-map propagation
-                A_pos_new = (coef_a    * A_pos) @ W_pos_b + \
-                            (coef_abar * A_neg) @ (theta_b * W_pos_b)
-
-                A_neg_new = (coef_a    * A_neg) @ W_neg_b + \
-                            (coef_abar * A_pos) @ (theta_b * W_neg_b)
-
-                # broadcast bias vectors per batch
-                b_pos_exp = b.clamp(min=0).unsqueeze(0).expand(batch, -1)     # (batch,out)
-                b_neg_exp = b.clamp(max=0).unsqueeze(0).expand(batch, -1)     # (batch,out)
-
-                # gamma for Planet upper shift
-                gamma_b = gamma.unsqueeze(-1)  # (batch,out,1)
-
-                # bias update – three terms
-                bias = bias \
-                    + torch.bmm(A_pos, b_pos_exp.unsqueeze(-1)).squeeze(-1) \
-                    + torch.bmm(A_neg, b_neg_exp.unsqueeze(-1)).squeeze(-1) \
-                    + torch.bmm(coef_abar * A_neg, gamma_b).squeeze(-1)
-
-                A_pos, A_neg = A_pos_new, A_neg_new
-
-            elif isinstance(layer, BoundReLU):
-                lb = layer.lower_l.clamp(max=0)
-                ub = layer.upper_u.clamp(min=0)
-                slope = ub / (ub - lb + 1e-12)
-                mask  = (slope > 0.5).float()
-
-                pos = A_pos.clamp(min=0); neg = A_pos.clamp(max=0)
-                A_pos = slope * pos + mask * neg
-
-                pos = A_neg.clamp(min=0); neg = A_neg.clamp(max=0)
-                A_neg = slope * neg + mask * pos
-
-                inc = torch.bmm(A_pos + A_neg, (-lb * slope).unsqueeze(-1)).squeeze(-1)
-                bias = bias + inc
-
-        # concrete lower bound on simplex (worst case = min since A_pos ≥0, A_neg≤0)
-        z_min = self.project_simplex(x_L)
-        bound = (A_pos + A_neg).bmm(z_min.view(batch, -1, 1)).squeeze(-1) + bias
-        return bound
-
-    def project_simplex(self, x):
-        v, _ = torch.sort(x, dim=1, descending=True)
-        cssv = torch.cumsum(v, dim=1) - 1
-        ind  = torch.arange(1, x.size(1) + 1, device=x.device)
-        cond = v - cssv / ind > 0
-        rho  = cond.sum(dim=1, keepdim=True)
-        theta = cssv.gather(1, rho - 1) / rho
-        return torch.clamp(x - theta, min=0)
+                a = m.alpha
+                # down-scale this layer
+                m.weight.data.div_(a)
+                m.bias.data.div_(a)
+                # up-scale the next linear layer
+                nxt = modules[i+1]
+                if isinstance(nxt, BoundLinear):
+                    nxt.weight.data.mul_(a)
+        return bs
     
 
 if __name__ == '__main__':
@@ -342,11 +301,11 @@ if __name__ == '__main__':
     if args.algorithm == 'crown':
         print('use default CROWN')
         boundedmodel = BoundedSequential.convert(model)
+        ub, lb = boundedmodel.compute_bounds(x_U=x_u, x_L=x_l, upper=True, lower=True, optimize=False)
     else:
         print('use simplex-verify algorithm')
         boundedmodel = SimplexBoundedSequential.convert(model)
-    
-    ub, lb = boundedmodel.compute_bounds(x_U=x_u, x_L=x_l, upper=True, lower=True)
+        ub, lb = boundedmodel.compute_bounds(x_U=x_u, x_L=x_l, upper=True, lower=True, optimize=True)
 
     for i in range(batch_size):
         for j in range(y_size):
