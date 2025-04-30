@@ -89,8 +89,10 @@ class BoundedSequential(nn.Sequential):
                 modules[i].lower_l = lb 
         # Get the final layer bound
         if optimize:
-            ans = self.simplex_verify(x_U=x_U, x_L=x_L)
-            return ans, ans
+            # 1) Upper bound: tightened by our simplex hull relaxation
+            ub_simplex = self.simplex_verify(x_U=x_U, x_L=x_L)
+
+            return ub_simplex, ub_simplex
         else:
             return self.boundpropogate_from_layer(x_U=x_U, x_L=x_L,
                                               C=torch.eye(modules[i].out_features).unsqueeze(0).to(x_U), upper=upper,
@@ -170,7 +172,7 @@ class BoundedSequential(nn.Sequential):
             lb = self.simplex_backward(x_U, x_L, a_list, abar_list)
             loss = -lb.mean()        # maximize mean lower bound
             optimizer.zero_grad()
-            loss.backward()
+            loss.backward(retain_graph=True)
             # project back into [0,1]
             with torch.no_grad():
                 for v in a_list + abar_list:
@@ -226,9 +228,9 @@ class BoundedSequential(nn.Sequential):
             ubias = upper_fn(x0)
             lbias = lower_fn(x0)
 
-            if ubias.shape[1] == out_dim:  
-                # now ubias, lbias, b all are (batch, out_dim)==(batch,10)
-                b = ubias + lbias + b
+            # if ubias.shape[1] == out_dim:  
+            #     # now ubias, lbias, b all are (batch, out_dim)==(batch,10)
+            #     b = ubias + lbias + b
 
             full_Ju = torch.autograd.functional.jacobian(upper_fn, x0, vectorize=True)
             full_Jl = torch.autograd.functional.jacobian(lower_fn, x0, vectorize=True)
@@ -242,6 +244,13 @@ class BoundedSequential(nn.Sequential):
             A_pos = A.clamp(min=0)
             A_neg = A.clamp(max=0)
             A = torch.bmm(A_neg, Ju) + torch.bmm(A_pos, Jl)
+
+            # first lift the two bias parts back into spec‐space
+            cbias = torch.bmm(A_neg, (ubias + lbias).unsqueeze(-1)).squeeze(-1) \
+                + torch.bmm(A_pos, (ubias + lbias).unsqueeze(-1)).squeeze(-1)
+
+            # now accumulate
+            b = cbias + b
 
         # Finally, minimize over x∈Δ by taking the minimum over the vertices:
         min_vert = A.min(dim=2).values
@@ -287,6 +296,11 @@ if __name__ == '__main__':
 
     batch_size = x_test.size(0)
     x_test = x_test.reshape(batch_size, -1)
+
+    #Normalize for simplex purposes
+    x_test = x_test.clamp(min=0)
+    x_test = x_test / (x_test.sum(dim=1, keepdim=True) + 1e-12)
+
     output = model(x_test)
     y_size = output.size(1)
     print("Network prediction: {}".format(output))
